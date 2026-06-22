@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube频道《真的很博通》日报 - GitHub Actions版本
-从环境变量读取配置，适用于云部署
+只推送当天更新的视频
 """
 import os
 import sys
@@ -9,7 +9,7 @@ import re
 import json
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ============ 配置（从环境变量读取） ============
 CHANNEL_ID = "UCNiJNzSkfumLB7bYtXcIEmg"
@@ -30,8 +30,7 @@ def send_telegram(text, retry=0):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
+            "text": text
         }
         
         response = requests.post(url, json=data, timeout=15)
@@ -87,59 +86,82 @@ def fetch_rss():
     
     return None
 
-def parse_videos(content):
-    """解析RSS内容"""
+def parse_today_videos(content):
+    """解析RSS内容，只返回当天的视频"""
     entries = re.findall(r"<entry>(.*?)</entry>", content, re.DOTALL)
     
+    # 获取今天的日期（北京时间，UTC+8）
+    beijing_tz = timezone(timedelta(hours=8))
+    today = datetime.now(beijing_tz).date()
+    
+    log(f"查询日期: {today}")
+    
     videos = []
-    for entry in entries[:15]:
+    for entry in entries:
         title_m = re.search(r"<title>(.*?)</title>", entry)
         vid_m = re.search(r"<yt:videoId>(.*?)</yt:videoId>", entry)
         views_m = re.search(r'views="(\d+)"', entry)
         pub_m = re.search(r"<published>(.*?)</published>", entry)
         
-        if title_m and vid_m:
-            published = ""
-            if pub_m:
-                try:
-                    dt = datetime.fromisoformat(pub_m.group(1).replace("+00:00", ""))
-                    published = dt.strftime("%m-%d %H:%M")
-                except Exception:
-                    pass
-            
-            videos.append({
-                "title": title_m.group(1),
-                "url": f"https://www.youtube.com/watch?v={vid_m.group(1)}",
-                "views": views_m.group(1) if views_m else "0",
-                "published": published
-            })
+        if title_m and vid_m and pub_m:
+            # 解析发布时间
+            try:
+                pub_str = pub_m.group(1)
+                pub_dt = datetime.fromisoformat(pub_str.replace("+00:00", "+00:00"))
+                pub_date = pub_dt.astimezone(beijing_tz).date()
+                
+                # 只保留当天的视频
+                if pub_date == today:
+                    published = pub_dt.astimezone(beijing_tz).strftime("%H:%M")
+                    
+                    videos.append({
+                        "title": title_m.group(1),
+                        "url": f"https://www.youtube.com/watch?v={vid_m.group(1)}",
+                        "views": views_m.group(1) if views_m else "0",
+                        "published": published
+                    })
+                    log(f"找到今日视频: {title_m.group(1)[:50]}...")
+            except Exception as e:
+                log(f"解析日期失败: {e}", "WARN")
+                continue
     
     return videos
 
 def generate_report(videos):
     """生成日报内容"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     
-    report = f"📺 YouTube频道《{CHANNEL_NAME}》日报\n"
-    report += f"📅 {today}\n"
-    report += "━━━━━━━━━━━━━━━━━━\n\n"
-    report += f"🆕 最新{len(videos)}个视频：\n\n"
-    
-    for i, v in enumerate(videos, 1):
-        report += f"{i}. {v['title']}\n"
-        if v['published']:
-            report += f"   📅 {v['published']}"
-        report += f" | 👁 {v['views']}次\n"
-        report += f"   🔗 {v['url']}\n\n"
-    
-    report += "━━━━━━━━━━━━━━━━━━\n"
-    report += "💡 点击链接可直接观看视频"
+    if not videos:
+        # 当天无更新
+        report = f"📺 YouTube频道《{CHANNEL_NAME}》日报\n"
+        report += f"📅 {today}\n"
+        report += "━━━━━━━━━━━━━━━━━━\n\n"
+        report += "😴 今日无更新\n\n"
+        report += "频道今天没有发布新视频。\n\n"
+        report += "━━━━━━━━━━━━━━━━━━\n"
+        report += "💡 点击链接访问频道: https://www.youtube.com/@zhendehenbotong"
+    else:
+        # 有更新
+        report = f"📺 YouTube频道《{CHANNEL_NAME}》日报\n"
+        report += f"📅 {today}\n"
+        report += "━━━━━━━━━━━━━━━━━━\n\n"
+        report += f"🆕 今日更新 {len(videos)} 个视频：\n\n"
+        
+        for i, v in enumerate(videos, 1):
+            report += f"{i}. {v['title']}\n"
+            report += f"   ⏰ {v['published']}"
+            report += f" | 👁 {v['views']}次\n"
+            report += f"   🔗 {v['url']}\n\n"
+        
+        report += "━━━━━━━━━━━━━━━━━━\n"
+        report += "💡 点击链接可直接观看视频"
     
     return report
 
 def main():
     log("=" * 50)
     log("YouTube日报推送任务开始（GitHub Actions）")
+    log(f"模式: 只推送当天更新的视频")
     
     # 检查配置
     if not TELEGRAM_BOT_TOKEN:
@@ -166,20 +188,9 @@ YouTube RSS API暂时不可用（已重试{MAX_RETRIES}次）。
         log("RSS获取最终失败，已发送错误通知", "ERROR")
         sys.exit(1)
     
-    # 解析视频
-    videos = parse_videos(content)
-    if not videos:
-        error_msg = f"""⚠️ YouTube日报解析失败
-
-频道：《{CHANNEL_NAME}》
-时间：{datetime.now().strftime("%Y-%m-%d %H:%M")}
-
-RSS内容解析失败，可能YouTube格式变更。"""
-        send_telegram(error_msg)
-        log("视频解析失败", "ERROR")
-        sys.exit(1)
-    
-    log(f"成功解析{len(videos)}个视频")
+    # 解析当天视频
+    videos = parse_today_videos(content)
+    log(f"今日视频数量: {len(videos)}")
     
     # 生成并发送日报
     report = generate_report(videos)
@@ -187,6 +198,10 @@ RSS内容解析失败，可能YouTube格式变更。"""
     
     if success:
         log("✅ 日报推送成功!")
+        if videos:
+            log(f"推送了 {len(videos)} 个今日视频")
+        else:
+            log("今日无更新，已发送无更新通知")
     else:
         log("❌ 日报推送失败", "ERROR")
         sys.exit(1)
